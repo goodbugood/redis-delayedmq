@@ -1,0 +1,43 @@
+{
+    "name": "shali/redis-delayedmq",
+    "description": "this is a delayed message queue base on redis sorted set.",
+    "keywords": [
+        "mq",
+        "message queue",
+        "redis",
+        "delay message queue"
+    ],
+    "type": "library",
+    "version": "1.0.0",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Shali\\": "src/Shali/"
+        },
+        "files": [
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\Shali\\": "tests/Shali/"
+        }
+    },
+    "authors": [
+        {
+            "name": "shali",
+            "email": "shali@gmail.com"
+        }
+    ],
+    "minimum-stability": "dev",
+    "require": {
+        "php": ">=5.4",
+        "ext-redis": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^4"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "prefer-stable": true
+}
