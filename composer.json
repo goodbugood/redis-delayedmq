@@ -8,7 +8,7 @@
         "delay message queue"
     ],
     "type": "library",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "license": "MIT",
     "autoload": {
         "psr-4": {

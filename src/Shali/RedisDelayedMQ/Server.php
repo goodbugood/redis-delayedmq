@@ -54,6 +54,7 @@ class Server
 
     /**
      * 运行
+     * @throws \InvalidArgumentException
      */
     public function run()
     {
@@ -67,16 +68,47 @@ class Server
 
     protected function handleTimeOut()
     {
+        $releaseScript = <<<LUA
+local reservedQueueName = KEYS[1]
+local readyQueueName = KEYS[2]
+local score = ARGV[1]
+local resultArray = redis.call('zrangebyscore', reservedQueueName, 0, score, 'limit', 0, 1)
+if #resultArray ~= 1 then
+    return -1
+end
+local payload = resultArray[1]
+if redis.call('zrem', reservedQueueName, payload) ~= 1 then
+    return -2
+end
+if false == redis.call('zrank', readyQueueName, payload) then
+    if redis.call('zadd', readyQueueName, score, payload) ~= 1 then
+        return -3
+    end
+end
+return payload
+LUA;
+
         foreach ($this->aWatchQueue as $sReadyQueueName => $sReservedQueueName) {
             while ($this->haveTimeOutJob($sReservedQueueName)) {
-                $aData = $this->oRedis->zRangeByScore($sReservedQueueName, 0, time(), ['limit' => [0, 1]]);
-                if (empty($aData)) {
+                $iTimeout = time();
+                // reserved => ready
+                $res = $this->oRedis->eval(
+                    $releaseScript,
+                    [
+                        $sReservedQueueName,
+                        $sReadyQueueName,
+                        $iTimeout,
+                    ],
+                    2
+                );
+                if (false === $res) {
+                    throw new \InvalidArgumentException($this->oRedis->getLastError());
+                } elseif (in_array($res, [-1, -2, -3,], true)) {
+                    // 插入失败
                     continue;
                 }
-                $sPayload = $aData[0];
-                // reserved => ready
-                $this->oRedis->zDelete($sReservedQueueName, $sPayload);
-                $this->oRedis->zAdd($sReadyQueueName, time(), $sPayload);
+
+                $sPayload = $res;
             }
         }
     }

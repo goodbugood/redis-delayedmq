@@ -78,6 +78,7 @@ class Client
     }
 
     /**
+     * element -> ready
      * @param string $sPayload
      * @param int $iDelay
      * @return bool
@@ -86,71 +87,105 @@ class Client
     {
         $iScore = time() + $iDelay;
 
-        // -> ready
-        return is_numeric($this->oRedis->zAdd($this->sReadyQueueName, $iScore, $sPayload));
+        // 添加存在的元素返回 0，但是会更新 score 从而影响顺序，所以认为添加成功
+        return $this->oRedis->zAdd($this->sReadyQueueName, $iScore, $sPayload) >= 0;
     }
 
     /**
+     * reserved => ready
      * @param string $sPayload
      * @param int $iDelay
      * @return bool
      */
     public function release($sPayload, $iDelay = 0)
     {
-        // reserved -> ready
-        $this->delete($sPayload);
-
-        return $this->put($sPayload, $iDelay);
-    }
-
-    public function bury($sPayload)
-    {
-        // reserved -> bury
-        $this->delete($sPayload);
-        $this->oRedis->zAdd($this->sBuriedQueueName, 0, $sPayload);
-
-        return true;
-    }
-
-    public function kick($sPayload, $iDelay = 0)
-    {
-        // bury -> ready
-        $this->oRedis->zDelete($this->sBuriedQueueName, $sPayload);
-
-        return $this->put($sPayload, $iDelay);
+        $iTimeout = time() + $iDelay;
+        return $this->atomRemAdd($this->sReservedQueueName, $this->sReadyQueueName, $sPayload, $iTimeout);
     }
 
     /**
+     * reserved => buried
+     * @param string $sPayload
+     * @return bool
+     */
+    public function bury($sPayload)
+    {
+        return $this->atomRemAdd($this->sReservedQueueName, $this->sBuriedQueueName, $sPayload, time());
+    }
+
+    /**
+     * buried => ready
+     * @param string $sPayload
+     * @param int $iDelay
+     * @return bool
+     */
+    public function kick($sPayload, $iDelay = 0)
+    {
+        $iTimeout = time() + $iDelay;
+        return $this->atomRemAdd($this->sBuriedQueueName, $this->sReadyQueueName, $sPayload, $iTimeout);
+    }
+
+    /**
+     * ready => reserved
      * 获取一个待消费的任务
      * 暂不支持超时重发
-     * @param int $iTimeout
+     * @param int $iTTR ttr（time to run）最大执行时间，单位秒，超时后，重新释放供其他消费者使用，0 永不超时
      * @return string|null
      */
-    public function reserve($iTimeout = 0)
+    public function reserve($iTTR = 0)
     {
-        $aData = $this->oRedis->zRangeByScore($this->sReadyQueueName, 0, time(), ['limit' => [0, 1]]);
-        if (empty($aData)) {
+        $reserveScript = <<<'LUA'
+local readyQueueName = KEYS[1]
+local reservedQueueName = KEYS[2]
+local score1 = ARGV[1]
+local score2 = ARGV[2]
+local resultArray = redis.call('zrangebyscore', readyQueueName, 0, score1, 'limit', 0, 1)
+if #resultArray ~= 1 then
+    return -1
+end
+local payload = resultArray[1]
+if redis.call('zrem', readyQueueName, payload) ~= 1 then
+    return -2
+end
+if false == redis.call('zrank', reservedQueueName, payload) then
+    if redis.call('zadd', reservedQueueName, score2, payload) ~= 1 then
+        return -3
+    end
+end
+return payload
+LUA;
+        $iNow = time();
+        $iScore = 0 === $iTTR ? -1 : $iNow + $iTTR;
+        $res = $this->oRedis->eval(
+            $reserveScript,
+            [
+                $this->sReadyQueueName,
+                $this->sReservedQueueName,
+                $iNow,
+                $iScore,
+            ],
+            2
+        );
+        if (false === $res) {
+            // 兼容旧的调用，暂不抛异常 $this->oRedis->getLastError()
+            return null;
+        } elseif (in_array($res, [-1, -2, -3,], true)) {
             return null;
         }
-        $sPayload = $aData[0];
-        $iScore = time() + $iTimeout;
-        // ready -> reserved
-        $this->oRedis->zDelete($this->sReadyQueueName, $sPayload);
-        $this->oRedis->zAdd($this->sReservedQueueName, $iScore, $sPayload);
+        $sPayload = $res;
 
         return $sPayload;
     }
 
     /**
+     * reserved -> delete
      * 删除队列中的元素
      * @param string $sPayload
      * @return bool
      */
     public function delete($sPayload)
     {
-        // reserved -> delete
-        // return $this->oRedis->zRem($this->sReservedQueueName, $sPayload) > 0;
-        return $this->oRedis->zDelete($this->sReservedQueueName, $sPayload) > 0;
+        return $this->oRedis->zRem($this->sReservedQueueName, $sPayload) > 0;
     }
 
     /**
@@ -184,5 +219,47 @@ class Client
         if (PHP_VERSION_ID > 50600) {
             $this->oRedis->close();
         }
+    }
+
+    /**
+     * 从旧队列中移除元素，并同时从新队列中添加元素，原子操作
+     * @param string $sOldQueueName
+     * @param string $sNewQueueName
+     * @param string $sPayload
+     * @param int $iTimeout
+     * @return bool
+     */
+    private function atomRemAdd($sOldQueueName, $sNewQueueName, $sPayload, $iTimeout)
+    {
+        $luaScript = <<<'LUA'
+local remZSetName = KEYS[1]
+local addZSetName = KEYS[2]
+local score = ARGV[1]
+local payload = ARGV[2]
+if redis.call('zrem', remZSetName, payload) ~= 1 then
+    return -1
+end
+if false == redis.call('zrank', addZSetName, payload) then
+    if redis.call('zadd', addZSetName, score, payload) ~= 1 then
+        return -2
+    end
+end
+return 1
+LUA;
+        $res = $this->oRedis->eval(
+            $luaScript,
+            [
+                $sOldQueueName,
+                $sNewQueueName,
+                $iTimeout,
+                $sPayload,
+            ],
+            2
+        );
+        if (false === $res) {
+            return false;
+        }
+
+        return 1 === $res;
     }
 }
